@@ -1,162 +1,254 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { can } from "@/lib/permissions";
-import { INITIAL_MESSAGES, mockParticipants } from "@/lib/mock-data";
 import { createRoomTransport } from "@/lib/room-transport";
-import type { ChatMessage, Participant, Role, RoomEvent } from "@/lib/types";
+import { newId } from "@/lib/user";
+import type {
+  ChatMessage,
+  ConnectionStatus,
+  Participant,
+  PlayerHandle,
+  RoomEvent,
+  RoomEventBody,
+  RoomTransport,
+} from "@/lib/types";
 
-interface UseRoomSyncOptions {
+interface Options {
   roomId: string;
-  selfId: string;
-  initialRole?: Role;
+  /** Must be referentially stable (useMemo) or the channel reconnects. */
+  me: Participant;
 }
 
-const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+interface Expected {
+  paused: boolean;
+  time: number;
+  /** Date.now() when `time` was recorded */
+  at: number;
+}
+
+const DRIFT_SECONDS = 1.5;
+const HEARTBEAT_MS = 5000;
+const MAX_MESSAGES = 200;
+
+const projectTime = (e: Expected) => (e.paused ? e.time : e.time + (Date.now() - e.at) / 1000);
 
 /**
- * Single source of truth for room state.
+ * Room state + sync.
  *
- * Data flow (identical for mock and Supabase):
- *   local action → permission check → apply locally → transport.send
- *   remote event → transport handler → apply locally
- *
- * Only `lib/room-transport.ts` knows how events travel.
+ * Host is the only source of truth for playback:
+ *   host player event → broadcast play/pause/seek (+ heartbeat "sync" every 5s)
+ *   guest receives    → updates `expected` → drives the local player
+ * Guests that try to control playback are snapped back to `expected`.
  */
-export function useRoomSync({ roomId, selfId, initialRole = "host" }: UseRoomSyncOptions) {
-  const [role, setRoleState] = useState<Role>(initialRole);
-  const [participants, setParticipants] = useState<Participant[]>(() => mockParticipants(initialRole));
-  const [messages, setMessages] = useState<ChatMessage[]>(INITIAL_MESSAGES);
-  const [isPaused, setIsPaused] = useState(true);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+export function useRoomSync({ roomId, me }: Options) {
+  const isHost = me.role === "host";
 
-  const timeRef = useRef(0);
-  const participantsRef = useRef(participants);
-  participantsRef.current = participants;
+  const [participants, setParticipants] = useState<Participant[]>([me]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [src, setSrc] = useState("");
+  const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  // Guests must click once so the browser allows audio/autoplay.
+  const [joined, setJoined] = useState(isHost);
 
-  const transport = useMemo(() => createRoomTransport(roomId), [roomId]);
+  const playerRef = useRef<PlayerHandle>(null);
+  const transportRef = useRef<RoomTransport | null>(null);
+  const expected = useRef<Expected>({ paused: true, time: 0, at: Date.now() });
+  const srcRef = useRef(src);
+  srcRef.current = src;
+  const joinedRef = useRef(joined);
+  joinedRef.current = joined;
 
-  const setTime = useCallback((t: number) => {
-    timeRef.current = t;
-    setCurrentTime(t);
+  const send = useCallback(
+    (body: RoomEventBody) => {
+      transportRef.current?.send({ ...body, senderId: me.id, senderRole: me.role } as RoomEvent);
+    },
+    [me.id, me.role]
+  );
+
+  /** Drive the local player to match a (paused, time) target. */
+  const applyPlayback = useCallback((paused: boolean, time: number) => {
+    expected.current = { paused, time, at: Date.now() };
+    const p = playerRef.current;
+    if (!p) return;
+    if (Math.abs(p.getTime() - time) > DRIFT_SECONDS) p.seekTo(time);
+    if (paused) {
+      p.pause();
+    } else if (joinedRef.current) {
+      p.play().catch(() => setJoined(false)); // blocked → ask for a click again
+    }
   }, []);
 
-  /** Applies any event (local or remote) to state. */
-  const apply = useCallback(
-    (event: RoomEvent) => {
-      switch (event.type) {
-        case "play":
-          setTime(event.time);
-          setIsPaused(false);
-          break;
-        case "pause":
-          setTime(event.time);
-          setIsPaused(true);
-          break;
-        case "seek":
-          setTime(event.time);
-          break;
+  /** Guest tried to take control: put the player back where the host says it is. */
+  const restore = useCallback(() => {
+    const p = playerRef.current;
+    if (!p || !joinedRef.current) return;
+    const target = projectTime(expected.current);
+    if (Math.abs(p.getTime() - target) > 2) p.seekTo(target);
+    if (expected.current.paused && !p.isPaused()) p.pause();
+    if (!expected.current.paused && p.isPaused()) p.play().catch(() => {});
+  }, []);
+
+  const sendSync = useCallback(() => {
+    const p = playerRef.current;
+    if (!p || !srcRef.current) return;
+    send({ type: "sync", src: srcRef.current, time: p.getTime(), paused: p.isPaused() });
+  }, [send]);
+
+  const handleEvent = useCallback(
+    (e: RoomEvent) => {
+      if (e.senderId === me.id) return;
+      const fromHost = e.senderRole === "host";
+
+      switch (e.type) {
         case "chat":
           setMessages((prev) =>
-            prev.some((m) => m.id === event.message.id) ? prev : [...prev, event.message]
+            prev.some((m) => m.id === e.message.id) ? prev : [...prev, e.message].slice(-MAX_MESSAGES)
           );
           break;
-        case "presence":
-          setParticipants(event.participants);
+        case "sync-request":
+          if (isHost) sendSync();
+          break;
+        case "video":
+          if (!fromHost) break;
+          expected.current = { paused: true, time: 0, at: Date.now() };
+          setSrc(e.src);
+          break;
+        case "sync":
+          if (!fromHost) break;
+          if (e.src !== srcRef.current) setSrc(e.src);
+          applyPlayback(e.paused, e.time);
+          break;
+        case "play":
+          if (fromHost) applyPlayback(false, e.time);
+          break;
+        case "pause":
+          if (fromHost) applyPlayback(true, e.time);
+          break;
+        case "seek":
+          if (fromHost) applyPlayback(expected.current.paused, e.time);
           break;
       }
     },
-    [setTime]
+    [me.id, isHost, sendSync, applyPlayback]
   );
 
-  // Remote events
+  // Connect to the room
   useEffect(() => {
-    const unsubscribe = transport.subscribe((event) => {
-      if (event.senderId === selfId) return;
+    const transport = createRoomTransport(roomId);
+    transportRef.current = transport;
 
-      // Only trust playback commands that come from the host.
-      if (event.type === "play" || event.type === "pause" || event.type === "seek") {
-        const sender = participantsRef.current.find((p) => p.id === event.senderId);
-        if (sender?.role !== "host") return;
-      }
-      apply(event);
+    const disconnect = transport.connect(me, {
+      onEvent: handleEvent,
+      onPresence: (list) => setParticipants(list.length ? list : [me]),
+      onStatus: (s) => {
+        setStatus(s);
+        if (s === "live" && !isHost) send({ type: "sync-request" });
+      },
     });
-    return unsubscribe;
-  }, [transport, selfId, apply]);
 
-  /** Apply optimistically, then broadcast. */
-  const dispatch = useCallback(
-    (event: RoomEvent) => {
-      apply(event);
-      void transport.send(event);
+    return () => {
+      disconnect();
+      transportRef.current = null;
+    };
+  }, [roomId, me, isHost, handleEvent, send]);
+
+  // Host heartbeat: lets late joiners and drifting guests catch up
+  useEffect(() => {
+    if (!isHost) return;
+    const id = setInterval(sendSync, HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [isHost, sendSync]);
+
+  // ── Player event handlers (wired to VideoPlayer) ──
+  const onPlay = useCallback(() => {
+    const p = playerRef.current;
+    if (!p) return;
+    if (isHost) {
+      expected.current = { paused: false, time: p.getTime(), at: Date.now() };
+      send({ type: "play", time: p.getTime() });
+    } else if (expected.current.paused) {
+      restore();
+    }
+  }, [isHost, send, restore]);
+
+  const onPause = useCallback(() => {
+    const p = playerRef.current;
+    if (!p) return;
+    if (isHost) {
+      expected.current = { paused: true, time: p.getTime(), at: Date.now() };
+      send({ type: "pause", time: p.getTime() });
+    } else if (!expected.current.paused) {
+      restore();
+    }
+  }, [isHost, send, restore]);
+
+  const onSeeked = useCallback(() => {
+    const p = playerRef.current;
+    if (!p) return;
+    if (isHost) {
+      expected.current = { ...expected.current, time: p.getTime(), at: Date.now() };
+      send({ type: "seek", time: p.getTime() });
+    } else {
+      restore();
+    }
+  }, [isHost, send, restore]);
+
+  /** Media is ready: guests jump to where the host currently is. */
+  const onReady = useCallback(() => {
+    if (!isHost) applyPlayback(expected.current.paused, projectTime(expected.current));
+  }, [isHost, applyPlayback]);
+
+  // ── Actions ──
+  const join = useCallback(() => {
+    joinedRef.current = true;
+    setJoined(true);
+    applyPlayback(expected.current.paused, projectTime(expected.current));
+    send({ type: "sync-request" });
+  }, [applyPlayback, send]);
+
+  const changeVideo = useCallback(
+    (nextSrc: string) => {
+      if (!can(me.role, "setVideo")) return;
+      expected.current = { paused: true, time: 0, at: Date.now() };
+      setSrc(nextSrc);
+      send({ type: "video", src: nextSrc });
     },
-    [apply, transport]
+    [me.role, send]
   );
 
-  // Playback (host only)
-  const play = useCallback(() => {
-    if (!can(role, "play")) return;
-    dispatch({ type: "play", senderId: selfId, time: timeRef.current });
-  }, [role, selfId, dispatch]);
-
-  const pause = useCallback(() => {
-    if (!can(role, "pause")) return;
-    dispatch({ type: "pause", senderId: selfId, time: timeRef.current });
-  }, [role, selfId, dispatch]);
-
-  const seek = useCallback(
-    (time: number) => {
-      if (!can(role, "seek")) return;
-      dispatch({ type: "seek", senderId: selfId, time });
-    },
-    [role, selfId, dispatch]
-  );
-
-  /**
-   * Called by the player's timeupdate. Local only, never broadcast.
-   * (Later: have the host send a periodic "seek" heartbeat so late joiners
-   * and drifting guests can resync.)
-   */
-  const reportTime = useCallback((t: number) => setTime(t), [setTime]);
-
-  // Chat (everyone)
   const sendMessage = useCallback(
     (text: string) => {
       const trimmed = text.trim();
-      if (!trimmed || !can(role, "chat")) return;
-      const author = participantsRef.current.find((p) => p.id === selfId)?.name ?? "You";
-      dispatch({
-        type: "chat",
-        senderId: selfId,
-        message: { id: uid(), senderId: selfId, author, text: trimmed, sentAt: Date.now() },
-      });
+      if (!trimmed || !can(me.role, "chat")) return;
+      const message: ChatMessage = {
+        id: newId(),
+        senderId: me.id,
+        author: me.name,
+        text: trimmed,
+        sentAt: Date.now(),
+      };
+      setMessages((prev) => [...prev, message].slice(-MAX_MESSAGES));
+      send({ type: "chat", message });
     },
-    [role, selfId, dispatch]
+    [me.id, me.name, me.role, send]
   );
 
-  /** Dev-only: preview the UI as Host or Guest. Remove when auth lands. */
-  const setRole = useCallback((next: Role) => {
-    setRoleState(next);
-    setParticipants(mockParticipants(next));
-  }, []);
-
   return {
-    // state
-    role,
+    isHost,
+    canControl: can(me.role, "play"),
     participants,
     messages,
-    isPaused,
-    currentTime,
-    duration,
-    canControl: can(role, "play"),
-    // actions
-    play,
-    pause,
-    seek,
-    reportTime,
-    setDuration,
+    src,
+    status,
+    joined,
+    playerRef,
+    onPlay,
+    onPause,
+    onSeeked,
+    onReady,
+    join,
+    changeVideo,
     sendMessage,
-    setRole,
   };
 }
