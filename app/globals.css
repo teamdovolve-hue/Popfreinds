@@ -7,3 +7,11 @@ body {
   background: #020617; /* slate-950 */
   color-scheme: dark;
 }
+
+/* Guests: visually disable the play button and timeline.
+   (Any attempt that still gets through is snapped back by useRoomSync.) */
+[data-locked="true"] .vds-play-button,
+[data-locked="true"] .vds-time-slider {
+  pointer-events: none;
+  opacity: 0.45;
+}
