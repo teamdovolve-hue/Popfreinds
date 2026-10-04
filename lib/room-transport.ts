@@ -1,74 +1,60 @@
-import { MOCK_GUEST_ID, MOCK_REPLIES } from "./mock-data";
-import type { RoomEvent, RoomEventHandler, RoomTransport } from "./types";
+import type { RealtimeChannel, SupabaseClient } from "@supabase/supabase-js";
+import { getSupabase } from "./supabase";
+import type { Participant, RoomEvent, RoomTransport } from "./types";
 
 /**
- * Mock transport: no network. It only replies to your chat messages
- * with a fake guest message so the UI feels alive.
+ * Supabase Realtime transport.
+ *  - Broadcast carries chat and playback events (ephemeral, not stored).
+ *  - Presence carries who is in the room.
  */
-export function createMockTransport(_roomId: string): RoomTransport {
-  const handlers = new Set<RoomEventHandler>();
-  const emit = (event: RoomEvent) => handlers.forEach((h) => h(event));
+export function createRoomTransport(roomId: string): RoomTransport {
+  let channel: RealtimeChannel | null = null;
 
   return {
-    subscribe(handler) {
-      handlers.add(handler);
+    connect(me, { onEvent, onPresence, onStatus }) {
+      let supabase: SupabaseClient;
+      try {
+        supabase = getSupabase();
+      } catch (err) {
+        console.error(err);
+        onStatus("error");
+        return () => {};
+      }
+
+      const ch = supabase.channel(`room:${roomId}`, {
+        config: {
+          broadcast: { self: false }, // don't receive our own events
+          presence: { key: me.id },
+        },
+      });
+      channel = ch;
+
+      ch.on("broadcast", { event: "room" }, ({ payload }) => onEvent(payload as RoomEvent))
+        .on("presence", { event: "sync" }, () => {
+          const people: Participant[] = Object.values(ch.presenceState<Participant>())
+            .flatMap((metas) => metas.slice(0, 1))
+            .map(({ id, name, role, color }) => ({ id, name, role, color }));
+          onPresence(people);
+        })
+        .subscribe(async (status) => {
+          if (status === "SUBSCRIBED") {
+            onStatus("live");
+            await ch.track(me);
+          } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+            onStatus("error");
+          } else if (status === "CLOSED") {
+            onStatus("connecting");
+          }
+        });
+
       return () => {
-        handlers.delete(handler);
+        supabase.removeChannel(ch);
+        if (channel === ch) channel = null;
       };
     },
+
     send(event) {
-      if (event.type !== "chat") return;
-      setTimeout(() => {
-        emit({
-          type: "chat",
-          senderId: MOCK_GUEST_ID,
-          message: {
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-            senderId: MOCK_GUEST_ID,
-            author: "Maya",
-            text: MOCK_REPLIES[Math.floor(Math.random() * MOCK_REPLIES.length)],
-            sentAt: Date.now(),
-          },
-        });
-      }, 1200);
+      void channel?.send({ type: "broadcast", event: "room", payload: event });
     },
   };
 }
-
-/**
- * The one line to change when Supabase goes in:
- *   export const createRoomTransport = createSupabaseTransport;
- */
-export const createRoomTransport = createMockTransport;
-
-/* ─────────────────────────────────────────────────────────────
- * Supabase Realtime version (npm i @supabase/supabase-js)
- * ─────────────────────────────────────────────────────────────
- *
- * import { createClient } from "@supabase/supabase-js";
- *
- * export function createSupabaseTransport(roomId: string): RoomTransport {
- *   const supabase = createClient(
- *     process.env.NEXT_PUBLIC_SUPABASE_URL!,
- *     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
- *   );
- *   const channel = supabase.channel(`room:${roomId}`, {
- *     config: { broadcast: { self: false } }, // don't echo our own events
- *   });
- *
- *   return {
- *     subscribe(handler) {
- *       channel
- *         .on("broadcast", { event: "room" }, ({ payload }) => handler(payload as RoomEvent))
- *         .subscribe();
- *       return () => { supabase.removeChannel(channel); };
- *     },
- *     send(event) {
- *       channel.send({ type: "broadcast", event: "room", payload: event });
- *     },
- *   };
- * }
- *
- * For participants, use channel.track() / presence sync instead of the
- * "presence" event, then feed the result into setParticipants.
- */

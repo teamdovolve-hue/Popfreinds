@@ -1,4 +1,5 @@
 export type Role = "host" | "guest";
+export type ConnectionStatus = "connecting" | "live" | "error";
 
 export interface Participant {
   id: string;
@@ -17,23 +18,39 @@ export interface ChatMessage {
   sentAt: number;
 }
 
-/**
- * Everything that travels over the wire. Keep this union small and
- * serializable: it maps 1:1 onto a Supabase Realtime broadcast payload.
- */
+interface EventBase {
+  senderId: string;
+  senderRole: Role;
+}
+
+/** Everything that travels over Supabase Broadcast. */
 export type RoomEvent =
-  | { type: "play"; senderId: string; time: number }
-  | { type: "pause"; senderId: string; time: number }
-  | { type: "seek"; senderId: string; time: number }
-  | { type: "chat"; senderId: string; message: ChatMessage }
-  | { type: "presence"; senderId: string; participants: Participant[] };
+  | (EventBase & { type: "chat"; message: ChatMessage })
+  | (EventBase & { type: "sync-request" })
+  | (EventBase & { type: "sync"; src: string; time: number; paused: boolean })
+  | (EventBase & { type: "video"; src: string })
+  | (EventBase & { type: "play" | "pause" | "seek"; time: number });
 
-export type RoomEventHandler = (event: RoomEvent) => void;
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+export type RoomEventBody = DistributiveOmit<RoomEvent, "senderId" | "senderRole">;
 
-/** The only surface the app needs from a realtime backend. */
+export interface TransportHandlers {
+  onEvent: (event: RoomEvent) => void;
+  onPresence: (participants: Participant[]) => void;
+  onStatus: (status: ConnectionStatus) => void;
+}
+
 export interface RoomTransport {
-  /** Start receiving events. Returns an unsubscribe function. */
-  subscribe(handler: RoomEventHandler): () => void;
-  /** Broadcast an event to everyone else in the room. */
-  send(event: RoomEvent): void | Promise<void>;
+  /** Join the room channel. Returns a disconnect function. */
+  connect(me: Participant, handlers: TransportHandlers): () => void;
+  send(event: RoomEvent): void;
+}
+
+/** Imperative controls the sync hook needs from the video player. */
+export interface PlayerHandle {
+  play(): Promise<void>;
+  pause(): void;
+  seekTo(time: number): void;
+  getTime(): number;
+  isPaused(): boolean;
 }
